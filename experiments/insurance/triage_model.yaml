@@ -1,0 +1,66 @@
+# Claims triage decision model (fictional). The decision table is a node of the DAG;
+# its rules reference the threshold levers, so changing a lever re-routes claims.
+name: claims-triage
+description: Route each claim to fast-track, standard handling or investigation.
+parameters:
+  cost_fast: 40
+  cost_standard: 180
+  cost_investigate: 900
+  catch_standard: 0.25      # share of fraud value recovered by standard handling
+  catch_investigate: 0.90   # share of fraud value recovered by an investigation
+  overpay_fast: 0.03        # average overpayment on legitimate fast-tracked claims
+  friction_investigate: 150 # goodwill cost of investigating an honest customer
+nodes:
+  - {name: investigate_at, kind: lever, options: [0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 0.8, 1.01],
+     description: fraud probability at or above which a claim is investigated}
+  - {name: fast_track_max, kind: lever, options: [0, 1000, 2500, 5000, 8000],
+     description: largest low-risk claim amount that may skip manual handling}
+
+  - {name: amount, kind: external, distribution: {dist: data, source: claims}}
+  - {name: claim_type, kind: external, distribution: {dist: data, source: claims}}
+  - {name: injury, kind: external, distribution: {dist: data, source: claims}}
+  - {name: fraud_p, kind: external, distribution: {dist: data, source: fraud model}}
+  - {name: is_fraud, kind: external, distribution: {dist: data, source: ground truth}}
+
+  - name: lane
+    kind: intermediate
+    table:
+      name: triage
+      hit_policy: FIRST
+      inputs: [fraud_p, claim_type, injury, amount]
+      outputs: [lane]
+      rules:
+        - {when: [">= investigate_at", "-", "-", "-"], then: ['"investigate"'],
+           annotation: fraud likelihood at or above the investigation threshold}
+        - {when: ["-", '"liability"', "-", "> 20000"], then: ['"standard"'],
+           annotation: large liability claims always get an adjuster}
+        - {when: ["-", "-", "true", "-"], then: ['"standard"'],
+           annotation: bodily injury needs manual handling}
+        - {when: ["< 0.1", '"auto", "property"', "-", "<= fast_track_max"], then: ['"fast-track"'],
+           annotation: low-risk small auto or property claim}
+        - {when: ["-", "-", "-", "-"], then: ['"standard"'], annotation: default lane}
+
+  - name: handling_cost
+    kind: intermediate
+    expr: >-
+      if lane = "fast-track" then cost_fast
+      else if lane = "standard" then cost_standard
+      else cost_investigate
+  - name: recovered_share
+    kind: intermediate
+    expr: >-
+      if lane = "investigate" then catch_investigate
+      else if lane = "standard" then catch_standard
+      else 0
+  - name: leakage
+    kind: intermediate
+    expr: >-
+      is_fraud * amount * (1 - recovered_share)
+      + (1 - is_fraud) * amount * overpay_fast * (if lane = "fast-track" then 1 else 0)
+  - name: friction
+    kind: intermediate
+    expr: '(1 - is_fraud) * (if lane = "investigate" then friction_investigate else 0)'
+  - name: total_cost
+    kind: outcome
+    utility_weight: -1
+    expr: handling_cost + leakage + friction
